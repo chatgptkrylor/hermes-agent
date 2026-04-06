@@ -444,3 +444,195 @@ def detect_ollama_server(base_url: str = OLLAMA_DEFAULT_BASE_URL) -> bool:
         return True
     except Exception:
         return False
+
+class OllamaClientWrapper:
+    """Wrapper that mimics OpenAI client interface for Hermes compatibility.
+    
+    This allows Hermes to use OllamaClient with the same interface as OpenAI.
+    """
+    
+    def __init__(self, base_url: str = "http://localhost:11434", 
+                 model: str = "qwen3.5:latest",
+                 timeout: float = 600.0,
+                 api_key: str = None):
+        self._client = OllamaClient(base_url=base_url, timeout=timeout)
+        self._model = model
+        self._base_url = base_url
+        self._timeout = timeout
+        self._api_key = api_key
+        
+        # Create chat completions interface
+        self.chat = ChatCompletionsWrapper(self._client, self._model)
+    
+    @property
+    def base_url(self):
+        return self._base_url
+    
+    @property
+    def api_key(self):
+        return self._api_key
+    
+    def close(self):
+        """Close the underlying client."""
+        self._client.close()
+    
+    @property
+    def is_closed(self):
+        """Check if client is closed."""
+        return self._client._client.is_closed
+
+
+class ChatCompletionsWrapper:
+    """Mimics OpenAI's chat.completions interface."""
+    
+    def __init__(self, client: OllamaClient, model: str):
+        self._client = client
+        self._model = model
+        self.completions = CompletionsWrapper(client, model)
+
+
+class ChatCompletionResponse:
+    """Mimics OpenAI's ChatCompletion response object."""
+    
+    def __init__(self, data: Dict[str, Any]):
+        self.id = data.get("id", "")
+        self.object = data.get("object", "chat.completion")
+        self.created = data.get("created", 0)
+        self.model = data.get("model", "")
+        self.choices = [ChatCompletionChoice(c) for c in data.get("choices", [])]
+        self.usage = ChatCompletionUsage(data.get("usage", {}))
+    
+    def __repr__(self):
+        return f"ChatCompletionResponse(id={self.id!r}, model={self.model!r}, choices={len(self.choices)})"
+
+
+class ChatCompletionChoice:
+    """Mimics OpenAI's choice object."""
+    
+    def __init__(self, data: Dict[str, Any]):
+        self.index = data.get("index", 0)
+        self.message = ChatCompletionMessage(data.get("message", {}))
+        self.finish_reason = data.get("finish_reason", "stop")
+    
+    def __repr__(self):
+        return f"ChatCompletionChoice(index={self.index}, finish_reason={self.finish_reason!r})"
+
+
+class ChatCompletionMessage:
+    """Mimics OpenAI's message object."""
+    
+    def __init__(self, data: Dict[str, Any]):
+        self.role = data.get("role", "assistant")
+        self.content = data.get("content", "")
+        self.tool_calls = data.get("tool_calls")
+    
+    def __repr__(self):
+        if self.tool_calls:
+            return f"ChatCompletionMessage(role={self.role!r}, content={self.content[:50]!r}..., tool_calls={len(self.tool_calls)})"
+        return f"ChatCompletionMessage(role={self.role!r}, content={self.content[:50]!r}...)"
+
+
+class ChatCompletionUsage:
+    """Mimics OpenAI's usage object."""
+    
+    def __init__(self, data: Dict[str, Any]):
+        self.prompt_tokens = data.get("prompt_tokens", 0)
+        self.completion_tokens = data.get("completion_tokens", 0)
+        self.total_tokens = data.get("total_tokens", 0)
+    
+    def __repr__(self):
+        return f"ChatCompletionUsage(prompt={self.prompt_tokens}, completion={self.completion_tokens}, total={self.total_tokens})"
+
+
+class CompletionsWrapper:
+    """Mimics OpenAI's chat.completions.create() interface."""
+    
+    def __init__(self, client: OllamaClient, model: str):
+        self._client = client
+        self._model = model
+    
+    def create(self, messages: List[Dict[str, Any]], 
+               model: str = None,
+               tools: List[Dict[str, Any]] = None,
+               tool_choice: Any = None,
+               stream: bool = False,
+               temperature: float = None,
+               max_tokens: int = None,
+               **kwargs) -> ChatCompletionResponse:
+        """Create a chat completion using Ollama native API."""
+        use_model = model or self._model
+        
+        # Call Ollama
+        response = self._client.chat(
+            model=use_model,
+            messages=messages,
+            tools=tools,
+            stream=stream,
+            temperature=temperature,
+            num_predict=max_tokens,
+            **kwargs
+        )
+        
+        # Convert to OpenAI-style response object
+        return ChatCompletionResponse(self._convert_to_openai_response(response, use_model))
+    
+    def _convert_to_openai_response(self, ollama_response: Dict[str, Any], 
+                                     model: str) -> Dict[str, Any]:
+        """Convert Ollama response to OpenAI format.
+        
+        OpenAI format:
+        {
+            "id": "chatcmpl-xxx",
+            "object": "chat.completion",
+            "created": 1234567890,
+            "model": "gpt-4",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "...",
+                    "tool_calls": [...]  # optional
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 50,
+                "total_tokens": 150
+            }
+        }
+        """
+        msg = ollama_response.get("message", {})
+        
+        # Build message
+        message = {
+            "role": "assistant",
+            "content": msg.get("content", "")
+        }
+        
+        # Add tool calls if present
+        if msg.get("tool_calls"):
+            message["tool_calls"] = msg["tool_calls"]
+        
+        # Build choice
+        choice = {
+            "index": 0,
+            "message": message,
+            "finish_reason": ollama_response.get("done_reason", "stop")
+        }
+        
+        # Build usage (Ollama provides these)
+        usage = {
+            "prompt_tokens": ollama_response.get("prompt_eval_count", 0),
+            "completion_tokens": ollama_response.get("eval_count", 0),
+            "total_tokens": ollama_response.get("prompt_eval_count", 0) + ollama_response.get("eval_count", 0)
+        }
+        
+        return {
+            "id": f"ollama-{hash(str(msg))}",
+            "object": "chat.completion",
+            "created": int(ollama_response.get("total_duration", 0) / 1e9),
+            "model": ollama_response.get("model", model),
+            "choices": [choice],
+            "usage": usage
+        }

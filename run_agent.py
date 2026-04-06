@@ -867,7 +867,8 @@ class AIAgent:
                 # No explicit creds — use the centralized provider router
                 from agent.auxiliary_client import resolve_provider_client
                 _routed_client, _ = resolve_provider_client(
-                    self.provider or "auto", model=self.model, raw_codex=True)
+                    self.provider or "auto", model=self.model, raw_codex=True,
+                    explicit_base_url=self.base_url)
                 if _routed_client is not None:
                     client_kwargs = {
                         "api_key": _routed_client.api_key,
@@ -3673,6 +3674,7 @@ class AIAgent:
         return False
 
     def _create_openai_client(self, client_kwargs: dict, *, reason: str, shared: bool) -> Any:
+        # Check for Copilot ACP first
         if self.provider == "copilot-acp" or str(client_kwargs.get("base_url", "")).startswith("acp://copilot"):
             from agent.copilot_acp_client import CopilotACPClient
 
@@ -3684,6 +3686,36 @@ class AIAgent:
                 self._client_log_context(),
             )
             return client
+        
+        # Check for Ollama server - use native adapter for tool support
+        from agent.model_metadata import detect_local_server_type
+        base_url = client_kwargs.get("base_url", "")
+        server_type = detect_local_server_type(base_url) if base_url else None
+        
+        if server_type == "ollama" or self.provider == "ollama":
+            from agent.ollama_adapter import OllamaClientWrapper
+            
+            # Extract model from client_kwargs or use self.model
+            model = self.model or "qwen3.5:latest"
+            timeout = client_kwargs.get("timeout", 600)
+            
+            # Strip /v1 suffix if present (native API uses /api/chat)
+            ollama_base = base_url.replace("/v1", "").replace("/api", "")
+            
+            client = OllamaClientWrapper(
+                base_url=ollama_base,
+                model=model,
+                timeout=timeout
+            )
+            logger.info(
+                "Ollama native client created (%s, shared=%s) model=%s %s",
+                reason,
+                shared,
+                model,
+                self._client_log_context(),
+            )
+            return client
+        
         client = OpenAI(**client_kwargs)
         logger.info(
             "OpenAI client created (%s, shared=%s) %s",
